@@ -888,9 +888,10 @@
     <!-- ════════════ ALPINE.JS & SUPABASE REALTIME LOGIC ════════════ -->
     <script>
         const SUPABASE_CONFIG = {
-            url: 'https://vibe-check-project.supabase.co',
-            anonKey: 'eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.dummy_anon_key_for_barkada_session_presence_tracking'
+            url: 'https://muumfqhcjoqmqmswaort.supabase.co',
+            anonKey: 'sb_publishable_qAJw1V0k8x04Fz0jOIhM_Q_wLWqzVe8'
         };
+        const JAM_SESSION_ID = 'pukirats-main-session';
 
         function musicPlayerApp() {
             return {
@@ -921,12 +922,11 @@
                 realtimeChannel: null,
                 isSupabaseConnected: false,
 
-                // Live tabs on this device, kept fresh with a heartbeat
                 liveSessions: [],
-                presenceStorageKey: 'pukirats_live_sessions',
-                presenceTtl: 6000,
+                sessionId: JAM_SESSION_ID,
                 presenceTimer: null,
-                presenceChannel: null,
+                presenceReady: false,
+                sessionSyncing: false,
 
                 get activeUsersList() {
                     if (this.liveSessions.length > 0) return this.liveSessions;
@@ -1026,6 +1026,7 @@
                     this.nowPlaying = { title: 'Playlist ' + (index + 1), artist: 'Spotify' };
                     this.currentSpotifyUrl = playlist.embed;
                     this.loadEmbedUri(playlist.uri);
+                    this.syncJamSession(false, this.nowPlaying.title);
                 },
 
                 markPlaylistAdded() {
@@ -1313,7 +1314,6 @@
                 init() {
                     // 1. Load user profile from localStorage
                     this.loadProfile();
-                    this.startLocalPresence();
 
                     // 2. Restore the shared jam queue and listen for local sync
                     this.loadSavedPlaylists();
@@ -1330,144 +1330,135 @@
                     }, 800);
                 },
 
-                readSessions() {
-                    try {
-                        const raw = JSON.parse(localStorage.getItem(this.presenceStorageKey) || '{}');
-                        return raw && typeof raw === 'object' && !Array.isArray(raw) ? raw : {};
-                    } catch (e) {
-                        return {};
-                    }
-                },
-
-                pruneSessions(map) {
-                    const now = Date.now();
-                    Object.keys(map).forEach((id) => {
-                        if (!map[id] || now - (map[id].seen || 0) > this.presenceTtl) delete map[id];
-                    });
-                    return map;
-                },
-
-                sessionsToList(map) {
-                    return Object.keys(map).map((id) => ({
-                        id,
-                        name: map[id].name || 'Friend',
-                        avatar: map[id].avatar || '🎧',
-                        isYou: id === this.clientId,
+                sessionsToList(users) {
+                    return (Array.isArray(users) ? users : []).filter(user => user && user.id).map((user) => ({
+                        id: user.id,
+                        name: user.name || 'Friend',
+                        avatar: user.avatar || '🎧',
+                        isYou: user.id === this.clientId,
                     })).sort((a, b) => (a.isYou === b.isYou ? a.name.localeCompare(b.name) : (a.isYou ? -1 : 1)));
                 },
 
-                publishPresence(remove) {
-                    const map = this.pruneSessions(this.readSessions());
-                    if (remove) delete map[this.clientId];
-                    else {
-                        map[this.clientId] = {
-                            name: this.userProfile.name || 'You',
-                            avatar: this.userProfile.avatar || '🌸',
-                            seen: Date.now(),
-                        };
-                    }
-                    try {
-                        localStorage.setItem(this.presenceStorageKey, JSON.stringify(map));
-                    } catch (e) { }
-                    this.liveSessions = this.sessionsToList(map);
-                    if (this.presenceChannel) {
-                        this.presenceChannel.postMessage({ id: this.clientId, map });
-                    }
-                },
-
-                leavePresence() {
-                    this.publishPresence(true);
-                },
-
-                startLocalPresence() {
-                    if (typeof BroadcastChannel !== 'undefined') {
-                        this.presenceChannel = new BroadcastChannel('pukirats-presence');
-                        this.presenceChannel.onmessage = (event) => {
-                            const map = event.data && event.data.map;
-                            if (!map || event.data.id === this.clientId) return;
-                            this.liveSessions = this.sessionsToList(this.pruneSessions({ ...map }));
-                        };
-                    }
-                    window.addEventListener('storage', (event) => {
-                        if (event.key !== this.presenceStorageKey || !event.newValue) return;
-                        try {
-                            this.liveSessions = this.sessionsToList(this.pruneSessions(JSON.parse(event.newValue)));
-                        } catch (e) { }
+                applyRemoteSession(row) {
+                    if (!row) return;
+                    const now = Date.now();
+                    const users = (Array.isArray(row.active_users) ? row.active_users : []).filter((user) => {
+                        if (!user || !user.id) return false;
+                        if (!user.seen) return true;
+                        return now - user.seen < 20000;
                     });
-                    window.addEventListener('pagehide', () => this.leavePresence());
-                    window.addEventListener('beforeunload', () => this.leavePresence());
-                    window.addEventListener('pageshow', () => this.publishPresence(false));
-                    this.publishPresence(false);
-                    this.presenceTimer = setInterval(() => this.publishPresence(false), 2000);
+                    const next = this.sessionsToList(users);
+                    if (this.presenceReady) {
+                        const known = new Set(this.liveSessions.map(user => user.id));
+                        next.forEach((user) => {
+                            if (!user.isYou && !known.has(user.id)) {
+                                this.showToast(user.name + ' joined the session!', user.avatar || '✨');
+                            }
+                        });
+                    }
+                    this.liveSessions = next;
+                    this.presenceReady = true;
+                    if (row.current_playlist) {
+                        this.nowPlaying = {
+                            title: row.current_playlist,
+                            artist: this.nowPlaying.artist || 'Spotify'
+                        };
+                    }
                 },
 
-                // ── Supabase Realtime Presence ──
+                async syncJamSession(remove, playlistTitle) {
+                    if (!this.supabaseClient || this.sessionSyncing) return;
+                    this.sessionSyncing = true;
+                    try {
+                        const { data } = await this.supabaseClient
+                            .from('jam_sessions')
+                            .select('active_users,current_playlist')
+                            .eq('id', this.sessionId)
+                            .maybeSingle();
+                        const now = Date.now();
+                        let users = Array.isArray(data && data.active_users) ? data.active_users.slice() : [];
+                        users = users.filter((user) => user && user.id && user.id !== this.clientId && (!user.seen || now - user.seen < 20000));
+                        if (!remove) {
+                            users.push({
+                                id: this.clientId,
+                                name: this.userProfile.name || 'You',
+                                avatar: this.userProfile.avatar || '🌸',
+                                seen: now
+                            });
+                        }
+                        const current_playlist = playlistTitle || (data && data.current_playlist) || this.nowPlaying.title || "Today's Top Hits";
+                        const { data: saved, error } = await this.supabaseClient
+                            .from('jam_sessions')
+                            .upsert({
+                                id: this.sessionId,
+                                active_users: users,
+                                current_playlist
+                            })
+                            .select('active_users,current_playlist')
+                            .maybeSingle();
+                        if (!error) this.applyRemoteSession(saved || { active_users: users, current_playlist });
+                    } catch (e) { }
+                    this.sessionSyncing = false;
+                },
+
+                removeSelfFromSession() {
+                    const users = (this.liveSessions || [])
+                        .filter(user => user && user.id && user.id !== this.clientId)
+                        .map(user => ({
+                            id: user.id,
+                            name: user.name,
+                            avatar: user.avatar,
+                            seen: Date.now()
+                        }));
+                    try {
+                        fetch(SUPABASE_CONFIG.url + '/rest/v1/jam_sessions?on_conflict=id', {
+                            method: 'POST',
+                            keepalive: true,
+                            headers: {
+                                apikey: SUPABASE_CONFIG.anonKey,
+                                Authorization: 'Bearer ' + SUPABASE_CONFIG.anonKey,
+                                'Content-Type': 'application/json',
+                                Prefer: 'resolution=merge-duplicates,return=minimal'
+                            },
+                            body: JSON.stringify({
+                                id: this.sessionId,
+                                active_users: users,
+                                current_playlist: this.nowPlaying.title || "Today's Top Hits"
+                            })
+                        });
+                    } catch (e) { }
+                },
+
                 initSupabaseRealtime() {
                     try {
-                        if (window.supabase && typeof window.supabase.createClient === 'function') {
-                            this.supabaseClient = window.supabase.createClient(SUPABASE_CONFIG.url, SUPABASE_CONFIG.anonKey);
-
-                            const channelName = 'barkada-vibe-session';
-                            this.realtimeChannel = this.supabaseClient.channel(channelName, {
-                                config: {
-                                    presence: {
-                                        key: this.userProfile.name + '-' + Math.random().toString(36).substring(2, 7)
-                                    }
-                                }
+                        if (!window.supabase || typeof window.supabase.createClient !== 'function') return;
+                        this.supabaseClient = window.supabase.createClient(SUPABASE_CONFIG.url, SUPABASE_CONFIG.anonKey);
+                        this.realtimeChannel = this.supabaseClient
+                            .channel('jam-sessions-pukirats')
+                            .on('postgres_changes', {
+                                event: '*',
+                                schema: 'public',
+                                table: 'jam_sessions',
+                                filter: 'id=eq.' + this.sessionId
+                            }, (payload) => {
+                                this.applyRemoteSession(payload && payload.new);
+                            })
+                            .subscribe((status) => {
+                                this.isSupabaseConnected = status === 'SUBSCRIBED';
                             });
-
-                            this.realtimeChannel
-                                .on('broadcast', { event: 'queue' }, ({ payload }) => {
-                                    this.applyRemoteQueue(payload);
-                                })
-                                .on('presence', { event: 'sync' }, () => {
-                                    const state = this.realtimeChannel.presenceState();
-                                    const allPresences = [];
-                                    for (const key in state) {
-                                        state[key].forEach(p => {
-                                            allPresences.push({
-                                                name: p.name,
-                                                avatar: p.avatar,
-                                                isYou: p.name === this.userProfile.name
-                                            });
-                                        });
-                                    }
-                                    if (allPresences.length > 0) {
-                                        this.isSupabaseConnected = true;
-                                    }
-                                })
-                                .on('presence', { event: 'join' }, ({ key, newPresences }) => {
-                                    newPresences.forEach(user => {
-                                        if (user.name && user.name !== this.userProfile.name) {
-                                            this.showToast(`${user.name} joined the session!`, user.avatar || '✨');
-                                        }
-                                    });
-                                })
-                                .subscribe(async (status) => {
-                                    if (status === 'SUBSCRIBED') {
-                                        await this.realtimeChannel.track({
-                                            name: this.userProfile.name,
-                                            avatar: this.userProfile.avatar,
-                                            online_at: new Date().toISOString()
-                                        });
-                                    }
-                                });
-                        }
-                    } catch (err) {
-                        console.warn('Supabase Realtime initialized in fallback simulation mode:', err);
-                    }
+                        this.syncJamSession(false);
+                        this.presenceTimer = setInterval(() => this.syncJamSession(false), 8000);
+                        window.onbeforeunload = () => {
+                            clearInterval(this.presenceTimer);
+                            this.removeSelfFromSession();
+                        };
+                        window.addEventListener('pagehide', () => this.removeSelfFromSession());
+                        window.addEventListener('pageshow', () => this.syncJamSession(false));
+                    } catch (err) { }
                 },
 
-                async updateRealtimePresence() {
-                    if (this.realtimeChannel) {
-                        try {
-                            await this.realtimeChannel.track({
-                                name: this.userProfile.name,
-                                avatar: this.userProfile.avatar,
-                                online_at: new Date().toISOString()
-                            });
-                        } catch (err) { }
-                    }
+                updateRealtimePresence() {
+                    this.syncJamSession(false, this.nowPlaying.title);
                 },
 
                 // ── Profile Setup & LocalStorage ──
@@ -1518,7 +1509,6 @@
 
                     this.hasSavedProfile = true;
                     this.showProfileModal = false;
-                    this.publishPresence(false);
                     this.updateRealtimePresence();
                     this.showToast(`Pass updated! Welcome, ${this.userProfile.name}!`, this.userProfile.avatar);
                 },
