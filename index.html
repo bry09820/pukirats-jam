@@ -676,7 +676,7 @@
                     <div class="flex items-center justify-between gap-3 rounded-2xl border border-sage-200 bg-[#F7FAF6] px-3 py-2.5">
                         <button type="button" @click="playSavedPlaylist(playlist)" class="min-w-0 text-left cursor-pointer">
                             <span class="block text-sm font-bold text-[#1F2422] truncate" x-text="'Playlist ' + (index + 1)"></span>
-                            <span class="block text-[11px] font-medium text-[#7D8F7B] truncate" x-text="playlist.spotifyId"></span>
+                            <span class="block text-[11px] font-medium text-[#7D8F7B] truncate" x-text="playlistCredit(playlist)"></span>
                         </button>
                         <button type="button" @click="removeSavedPlaylist(playlist.id)"
                             class="tap-target inline-flex items-center px-2 text-[10px] font-extrabold uppercase tracking-wide text-[#A08A7A] hover:text-[#1F2422] cursor-pointer shrink-0">
@@ -847,8 +847,16 @@
                     <p class="text-[10px] font-extrabold uppercase tracking-[0.16em] text-[#A4C3A0]">Currently playing</p>
                     <p class="text-base font-bold mt-1 truncate" x-text="nowPlaying.title"></p>
                     <p class="text-[12px] font-medium text-white/70 truncate" x-text="nowPlaying.artist || 'Spotify'"></p>
-                    <p class="text-[11px] font-semibold mt-2 text-[#C7DAC4]" x-text="playbackStatus"></p>
+                    <p class="text-[11px] font-semibold mt-2 text-[#C7DAC4]" x-show="activePlaylistCredit" x-text="activePlaylistCredit"></p>
+                    <p class="text-[11px] font-semibold mt-1 text-[#C7DAC4]" x-text="playbackStatus"></p>
                 </section>
+                <template x-for="(playlist, index) in savedPlaylists" :key="'shared-' + playlist.id">
+                    <article class="bg-white border border-sage-200/80 rounded-2xl px-3.5 py-3 shadow-sm cursor-pointer"
+                        @click="playSavedPlaylist(playlist)">
+                        <p class="text-sm font-bold text-[#1F2422] truncate" x-text="'Playlist ' + (index + 1)"></p>
+                        <p class="text-[12px] font-medium text-[#7D8F7B] truncate mt-1" x-text="playlistCredit(playlist)"></p>
+                    </article>
+                </template>
                 <template x-for="(item, index) in queue" :key="item.id">
                     <article class="bg-white border border-sage-200/80 rounded-2xl px-3.5 py-3 shadow-sm cursor-pointer"
                         @click="focusQueueItem(item)">
@@ -879,7 +887,7 @@
                 <div x-show="queue.length === 0" class="text-center py-10 px-6">
                     <p class="text-3xl mb-2">🎧</p>
                     <p class="text-sm font-bold text-[#1F2422]">The wishlist is empty</p>
-                    <p class="text-xs font-medium text-[#7D8F7B] mt-1">Load a playlist and it will show up here.</p>
+                    <p class="text-xs font-medium text-[#7D8F7B] mt-1">Load a playlist and everyone in the jam can listen along.</p>
                 </div>
             </div>
         </aside>
@@ -927,6 +935,9 @@
                 presenceTimer: null,
                 presenceReady: false,
                 sessionSyncing: false,
+                pendingPublish: false,
+                jamRevision: 0,
+                sessionStateJson: '',
 
                 get activeUsersList() {
                     if (this.liveSessions.length > 0) return this.liveSessions;
@@ -1026,7 +1037,7 @@
                     this.nowPlaying = { title: 'Playlist ' + (index + 1), artist: 'Spotify' };
                     this.currentSpotifyUrl = playlist.embed;
                     this.loadEmbedUri(playlist.uri);
-                    this.syncJamSession(false, this.nowPlaying.title);
+                    this.syncJamSession(false, true);
                 },
 
                 markPlaylistAdded() {
@@ -1053,6 +1064,7 @@
                     this.savedPlaylists = this.savedPlaylists.filter(item => item.id !== id);
                     if (wasSelected) this.selectedPlaylistId = '';
                     this.persistPlaylists();
+                    this.syncJamSession(false, true);
                 },
 
                 parsePlaylistLink(raw) {
@@ -1085,6 +1097,10 @@
                             spotifyId: parsed.id,
                             embed: parsed.embed,
                             uri: parsed.uri,
+                            addedBy: {
+                                name: this.userProfile.name || 'You',
+                                avatar: this.userProfile.avatar || '🌸'
+                            }
                         };
                         this.savedPlaylists.push(saved);
                         this.persistPlaylists();
@@ -1220,18 +1236,8 @@
                     try {
                         localStorage.setItem(this.queueStorageKey, JSON.stringify(payload));
                     } catch (e) { }
-                    if (!broadcast) return;
-                    if (this.queueChannel) {
-                        this.queueChannel.postMessage(payload);
-                    }
-                    if (this.realtimeChannel && typeof this.realtimeChannel.send === 'function') {
-                        const sent = this.realtimeChannel.send({
-                            type: 'broadcast',
-                            event: 'queue',
-                            payload,
-                        });
-                        if (sent && typeof sent.catch === 'function') sent.catch(() => { });
-                    }
+                    if (!broadcast || this.applyingRemoteQueue) return;
+                    this.syncJamSession(false, true);
                 },
 
                 applyRemoteQueue(payload) {
@@ -1339,6 +1345,82 @@
                     })).sort((a, b) => (a.isYou === b.isYou ? a.name.localeCompare(b.name) : (a.isYou ? -1 : 1)));
                 },
 
+                playlistCredit(playlist) {
+                    const person = playlist && playlist.addedBy;
+                    if (!person || !person.name) return (playlist && playlist.spotifyId) || 'Shared playlist';
+                    return 'Added by ' + person.name;
+                },
+
+                get activePlaylistCredit() {
+                    const uri = this.loadedUri;
+                    const playlist = this.savedPlaylists.find(item => item.id === this.selectedPlaylistId)
+                        || this.savedPlaylists.find(item => item.uri === uri);
+                    if (!playlist || !playlist.addedBy || !playlist.addedBy.name) return '';
+                    return 'Added by ' + playlist.addedBy.name;
+                },
+
+                parseSessionState(raw) {
+                    if (!raw) return null;
+                    if (typeof raw === 'object') return raw;
+                    const text = String(raw).trim();
+                    if (text.charAt(0) !== '{') return { title: text, revision: 0 };
+                    try {
+                        return JSON.parse(text);
+                    } catch (e) {
+                        return { title: text, revision: 0 };
+                    }
+                },
+
+                sharedContentPayload() {
+                    return {
+                        title: this.nowPlaying.title || "Today's Top Hits",
+                        uri: this.loadedUri || this.uriFromEmbed(this.currentSpotifyUrl) || 'spotify:playlist:37i9dQZF1DXcBWIGoYBM5M',
+                        embed: this.currentSpotifyUrl,
+                        queue: this.queue,
+                        playlists: this.savedPlaylists.slice(0, 5),
+                        revision: this.jamRevision || 0,
+                        sender: this.clientId
+                    };
+                },
+
+                applySharedContent(state) {
+                    if (!state) return;
+                    const revision = state.revision || 0;
+                    const fromOther = !!(state.sender && state.sender !== this.clientId);
+                    if (fromOther && revision && revision <= this.jamRevision) return;
+                    if (Array.isArray(state.playlists)) {
+                        this.savedPlaylists = state.playlists.filter(item => item && item.spotifyId && item.embed).slice(0, 5);
+                        this.persistPlaylists();
+                    }
+                    if (Array.isArray(state.queue)) {
+                        this.applyingRemoteQueue = true;
+                        this.queue = state.queue.map(item => this.normalizeQueueItem(item)).filter(Boolean);
+                        this.queueRevision = revision || this.queueRevision;
+                        try {
+                            localStorage.setItem(this.queueStorageKey, JSON.stringify({
+                                queue: this.queue,
+                                revision: this.queueRevision,
+                                sender: state.sender || ''
+                            }));
+                        } catch (e) { }
+                        this.applyingRemoteQueue = false;
+                    }
+                    if (state.title) {
+                        this.nowPlaying = { title: state.title, artist: 'Spotify' };
+                    }
+                    if (state.embed) this.currentSpotifyUrl = state.embed;
+                    if (state.uri) {
+                        const match = this.savedPlaylists.find(item => item.uri === state.uri);
+                        if (match) this.selectedPlaylistId = match.id;
+                        this.loadEmbedUri(state.uri);
+                    }
+                    if (revision) this.jamRevision = Math.max(this.jamRevision, revision);
+                    try {
+                        this.sessionStateJson = JSON.stringify(state);
+                    } catch (e) { }
+                    if (fromOther && revision) this.showToast('Shared playlist updated', '🎧');
+                },
+
                 applyRemoteSession(row) {
                     if (!row) return;
                     const now = Date.now();
@@ -1358,16 +1440,16 @@
                     }
                     this.liveSessions = next;
                     this.presenceReady = true;
-                    if (row.current_playlist) {
-                        this.nowPlaying = {
-                            title: row.current_playlist,
-                            artist: this.nowPlaying.artist || 'Spotify'
-                        };
-                    }
+                    const state = this.parseSessionState(row.current_playlist);
+                    if (state) this.applySharedContent(state);
                 },
 
-                async syncJamSession(remove, playlistTitle) {
-                    if (!this.supabaseClient || this.sessionSyncing) return;
+                async syncJamSession(remove, publishContent) {
+                    if (!this.supabaseClient) return;
+                    if (this.sessionSyncing) {
+                        if (publishContent) this.pendingPublish = true;
+                        return;
+                    }
                     this.sessionSyncing = true;
                     try {
                         const { data } = await this.supabaseClient
@@ -1375,6 +1457,15 @@
                             .select('active_users,current_playlist')
                             .eq('id', this.sessionId)
                             .maybeSingle();
+                        const remote = this.parseSessionState(data && data.current_playlist);
+                        let shouldPublish = !!publishContent;
+                        const remoteEmpty = !remote || !(remote.revision > 0);
+                        if (!shouldPublish && remoteEmpty && (this.savedPlaylists.length || this.queue.length)) {
+                            shouldPublish = true;
+                        }
+                        if (!shouldPublish && remote && (remote.revision || 0) > this.jamRevision) {
+                            this.applySharedContent(remote);
+                        }
                         const now = Date.now();
                         let users = Array.isArray(data && data.active_users) ? data.active_users.slice() : [];
                         users = users.filter((user) => user && user.id && user.id !== this.clientId && (!user.seen || now - user.seen < 20000));
@@ -1386,19 +1477,35 @@
                                 seen: now
                             });
                         }
-                        const current_playlist = playlistTitle || (data && data.current_playlist) || this.nowPlaying.title || "Today's Top Hits";
+                        let content = remote || this.sharedContentPayload();
+                        if (shouldPublish) {
+                            content = this.sharedContentPayload();
+                            content.revision = Date.now();
+                            content.sender = this.clientId;
+                            this.jamRevision = content.revision;
+                            this.sessionStateJson = JSON.stringify(content);
+                        }
+                        const payload = {
+                            id: this.sessionId,
+                            active_users: users
+                        };
+                        if (shouldPublish) payload.current_playlist = this.sessionStateJson;
                         const { data: saved, error } = await this.supabaseClient
                             .from('jam_sessions')
-                            .upsert({
-                                id: this.sessionId,
-                                active_users: users,
-                                current_playlist
-                            })
+                            .upsert(payload)
                             .select('active_users,current_playlist')
                             .maybeSingle();
-                        if (!error) this.applyRemoteSession(saved || { active_users: users, current_playlist });
+                        if (!error && saved) {
+                            const savedUsers = Array.isArray(saved.active_users) ? saved.active_users : users;
+                            this.liveSessions = this.sessionsToList(savedUsers);
+                            this.presenceReady = true;
+                        }
                     } catch (e) { }
                     this.sessionSyncing = false;
+                    if (this.pendingPublish) {
+                        this.pendingPublish = false;
+                        this.syncJamSession(false, true);
+                    }
                 },
 
                 removeSelfFromSession() {
@@ -1422,8 +1529,7 @@
                             },
                             body: JSON.stringify({
                                 id: this.sessionId,
-                                active_users: users,
-                                current_playlist: this.nowPlaying.title || "Today's Top Hits"
+                                active_users: users
                             })
                         });
                     } catch (e) { }
@@ -1458,7 +1564,7 @@
                 },
 
                 updateRealtimePresence() {
-                    this.syncJamSession(false, this.nowPlaying.title);
+                    this.syncJamSession(false, false);
                 },
 
                 // ── Profile Setup & LocalStorage ──
